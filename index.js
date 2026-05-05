@@ -34,6 +34,7 @@ const SATURDAY_SLOTS = [
 
 const MAX_PER_HOUR = 4;
 const MAX_PER_HALFHOUR = 2;
+const BUFFER_MIN = 15; // patient must book at least 15 min before slot start
 
 // ====== HELPERS ======
 async function callAppsScript(payload) {
@@ -64,29 +65,64 @@ async function sendWhatsApp(to, body) {
 function isValidAge(t) { const n = parseInt(t); return !isNaN(n) && n >= 1 && n <= 120; }
 function isValidPhone(t) { return /^[6-9]\d{9}$/.test(t.replace(/\s+/g, '')); }
 
-// Generate next 10 days excluding Sundays, in IST
+// ====== TIME HELPERS (IST aware) ======
+function nowIST() {
+  const now = new Date();
+  const istOffsetMs = 5.5 * 60 * 60 * 1000;
+  return new Date(now.getTime() + istOffsetMs);
+}
+
+function slotStartMinutes(slot) {
+  const start = slot.split("-")[0].trim();
+  const m = start.match(/(\d+):(\d+)\s*(AM|PM)/i);
+  if (!m) return 0;
+  let hh = parseInt(m[1]);
+  const mm = parseInt(m[2]);
+  const ampm = m[3].toUpperCase();
+  if (ampm === "PM" && hh !== 12) hh += 12;
+  if (ampm === "AM" && hh === 12) hh = 0;
+  return hh * 60 + mm;
+}
+
+// Generate next 10 days excluding Sundays, skipping today if no slots remain
 function getAvailableDates() {
   const dates = [];
-  const today = new Date();
-  // Adjust to IST
-  const istOffset = 5.5 * 60 * 60 * 1000;
-  const istNow = new Date(today.getTime() + istOffset);
+  const ist = nowIST();
+  const currentMinutes = ist.getUTCHours() * 60 + ist.getUTCMinutes();
 
   for (let i = 0; i < 10; i++) {
-    const d = new Date(istNow);
-    d.setDate(istNow.getDate() + i);
-    if (d.getUTCDay() === 0) continue; // skip Sunday (0 = Sunday)
+    const d = new Date(ist);
+    d.setUTCDate(ist.getUTCDate() + i);
+    const dow = d.getUTCDay();
+    if (dow === 0) continue; // skip Sundays
+
+    // For today, only include if at least one slot is still bookable
+    if (i === 0) {
+      const slotsToday = (dow === 6) ? SATURDAY_SLOTS : WEEKDAY_SLOTS;
+      const hasFutureSlot = slotsToday.some(
+        s => slotStartMinutes(s) >= currentMinutes + BUFFER_MIN
+      );
+      if (!hasFutureSlot) continue;
+    }
+
     dates.push({
-      iso: d.toISOString().split('T')[0], // yyyy-MM-dd
-      display: d.toUTCString().split(' ').slice(0, 3).join(' '), // "Mon, 05 May"
-      dayOfWeek: d.getUTCDay() // 1-6 (Mon-Sat)
+      iso: d.toISOString().split('T')[0],
+      display: d.toUTCString().split(' ').slice(0, 3).join(' '),
+      dayOfWeek: dow,
+      isToday: (i === 0)
     });
   }
   return dates;
 }
 
 function getSlotsForDate(dateInfo) {
-  return dateInfo.dayOfWeek === 6 ? SATURDAY_SLOTS : WEEKDAY_SLOTS;
+  const allSlots = (dateInfo.dayOfWeek === 6) ? SATURDAY_SLOTS : WEEKDAY_SLOTS;
+  if (!dateInfo.isToday) return allSlots;
+
+  // For today only — filter out past slots (with buffer)
+  const ist = nowIST();
+  const currentMinutes = ist.getUTCHours() * 60 + ist.getUTCMinutes();
+  return allSlots.filter(s => slotStartMinutes(s) >= currentMinutes + BUFFER_MIN);
 }
 
 function isHalfHourSlot(slot) {
@@ -193,8 +229,11 @@ async function handlePhone(phone, text, session) {
     await sendWhatsApp(phone, "❌ Please enter a valid 10-digit Indian mobile number.");
     return;
   }
-  // Move to date selection
   const dates = getAvailableDates();
+  if (dates.length === 0) {
+    await sendWhatsApp(phone, "😔 Sorry, no booking dates are available right now. Please try again later.");
+    return;
+  }
   let msg = "📅 Please select your appointment date:\n\n";
   dates.forEach((d, i) => msg += `${i + 1}. ${d.display}\n`);
   msg += "\nReply with the number.";
@@ -215,7 +254,7 @@ async function handleDateSelection(phone, text, session) {
   }
   const selectedDate = dates[choice - 1];
 
-  // Check duplicate
+  // Duplicate check
   const cleanPhone = phone.replace("whatsapp:", "").replace("+", "");
   const dup = await callAppsScript({
     action: "checkDuplicate", phone: cleanPhone,
@@ -226,7 +265,7 @@ async function handleDateSelection(phone, text, session) {
     return;
   }
 
-  // Get slots for that day, filter out full ones
+  // Build available slots
   const slotsForDay = getSlotsForDate(selectedDate);
   const availableSlots = [];
   for (const slot of slotsForDay) {
@@ -239,7 +278,7 @@ async function handleDateSelection(phone, text, session) {
   }
 
   if (availableSlots.length === 0) {
-    await sendWhatsApp(phone, `😔 Sorry, all slots are full for ${selectedDate.display}. Please pick another date.\n\nSend 'reset' to start over.`);
+    await sendWhatsApp(phone, `😔 Sorry, no slots available for ${selectedDate.display}. Please pick another date.\n\nSend 'reset' to start over.`);
     return;
   }
 
@@ -252,17 +291,15 @@ async function handleDateSelection(phone, text, session) {
     doctor: session.doctor, patientName: session.patientName,
     age: session.age, date: selectedDate.iso
   });
-  // We store available slots indirectly — re-query at confirmation
   await sendWhatsApp(phone, msg);
 }
 
 async function handleSlotSelection(phone, text, session) {
   const choice = parseInt(text);
-  // Re-compute available slots
   const dates = getAvailableDates();
   const dateInfo = dates.find(d => d.iso === session.date);
   if (!dateInfo) {
-    await sendWhatsApp(phone, "⚠️ Date error. Please send 'reset' to start over.");
+    await sendWhatsApp(phone, "⚠️ Date is no longer available. Please send 'reset' to start over.");
     return;
   }
   const slotsForDay = getSlotsForDate(dateInfo);
@@ -274,6 +311,11 @@ async function handleSlotSelection(phone, text, session) {
     });
     const cap = isHalfHourSlot(slot) ? MAX_PER_HALFHOUR : MAX_PER_HOUR;
     if ((cnt.count || 0) < cap) availableSlots.push(slot);
+  }
+
+  if (availableSlots.length === 0) {
+    await sendWhatsApp(phone, "😔 No slots available anymore. Please send 'reset' and try again.");
+    return;
   }
 
   if (isNaN(choice) || choice < 1 || choice > availableSlots.length) {
@@ -308,7 +350,7 @@ async function handleConfirmation(phone, text, session) {
   const cleanPhone = phone.replace("whatsapp:", "").replace("+", "");
 
   if (choice === "1" || choice.toLowerCase().includes("confirm")) {
-    // FINAL availability check before saving
+    // Final availability check before saving
     const cnt = await callAppsScript({
       action: "getSlotBookingCount",
       doctor: session.doctor, date: session.date, timeSlot: session.timeSlot
