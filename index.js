@@ -6,35 +6,19 @@ const app = express();
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
-// ====== CONFIG ======
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
 const TWILIO_WHATSAPP_NUMBER = process.env.TWILIO_WHATSAPP_NUMBER;
 const APPS_SCRIPT_URL = process.env.APPS_SCRIPT_URL;
+const BUFFER_MIN = 15;
 
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
-const WEEKDAY_SLOTS = [
-  "8:30 AM - 9:30 AM", "9:30 AM - 10:30 AM", "10:30 AM - 11:30 AM",
-  "11:30 AM - 12:30 PM", "2:00 PM - 3:00 PM", "3:00 PM - 4:00 PM",
-  "4:00 PM - 4:30 PM"
-];
-const SATURDAY_SLOTS = [
-  "8:30 AM - 9:30 AM", "9:30 AM - 10:30 AM",
-  "10:30 AM - 11:30 AM", "11:30 AM - 12:30 PM"
-];
-
-const MAX_PER_HOUR = 4;
-const MAX_PER_HALFHOUR = 2;
-const BUFFER_MIN = 15;
-
-// ====== TIME HELPERS ======
 function getISTNow() {
   const fmt = new Intl.DateTimeFormat('en-IN', {
     timeZone: 'Asia/Kolkata',
     year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', hour12: false,
-    weekday: 'short'
+    hour: '2-digit', minute: '2-digit', hour12: false, weekday: 'short'
   });
   const parts = fmt.formatToParts(new Date());
   const get = (t) => parts.find(p => p.type === t).value;
@@ -52,12 +36,9 @@ function getISTNow() {
 function addDaysIST(baseYear, baseMonth, baseDate, daysToAdd) {
   const d = new Date(Date.UTC(baseYear, baseMonth - 1, baseDate));
   d.setUTCDate(d.getUTCDate() + daysToAdd);
-  const y = d.getUTCFullYear();
-  const m = d.getUTCMonth() + 1;
-  const dt = d.getUTCDate();
-  const dow = d.getUTCDay();
   const monthNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
   const dayNames = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  const y = d.getUTCFullYear(), m = d.getUTCMonth() + 1, dt = d.getUTCDate(), dow = d.getUTCDay();
   const iso = `${y}-${String(m).padStart(2,'0')}-${String(dt).padStart(2,'0')}`;
   const display = `${dayNames[dow]}, ${String(dt).padStart(2,'0')} ${monthNames[m-1]}`;
   return { year: y, month: m, date: dt, day: dow, iso, display };
@@ -67,22 +48,42 @@ function slotStartMinutes(slot) {
   const start = slot.split("-")[0].trim();
   const m = start.match(/(\d+):(\d+)\s*(AM|PM)/i);
   if (!m) return 0;
-  let hh = parseInt(m[1]);
-  const mm = parseInt(m[2]);
+  let hh = parseInt(m[1]); const mm = parseInt(m[2]);
   const ampm = m[3].toUpperCase();
   if (ampm === "PM" && hh !== 12) hh += 12;
   if (ampm === "AM" && hh === 12) hh = 0;
   return hh * 60 + mm;
 }
 
-function getAvailableDates() {
+function normalizeDateString(d) {
+  if (!d) return null;
+  if (d instanceof Date) {
+    return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata', year:'numeric', month:'2-digit', day:'2-digit' }).format(d);
+  }
+  const s = String(d).trim();
+  if (s.includes('T')) {
+    try {
+      const parsed = new Date(s);
+      if (!isNaN(parsed.getTime())) {
+        return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata', year:'numeric', month:'2-digit', day:'2-digit' }).format(parsed);
+      }
+    } catch(e) {}
+  }
+  const match = s.match(/(\d{4})-(\d{2})-(\d{2})/);
+  if (match) return `${match[1]}-${match[2]}-${match[3]}`;
+  return null;
+}
+
+async function getAvailableDates() {
   const dates = [];
   const ist = getISTNow();
   for (let i = 0; i < 10; i++) {
     const d = addDaysIST(ist.year, ist.month, ist.date, i);
     if (d.day === 0) continue;
     if (i === 0) {
-      const slotsToday = (d.day === 6) ? SATURDAY_SLOTS : WEEKDAY_SLOTS;
+      // Check if any slot today is still bookable using server slot definitions
+      const slotsRes = await callAppsScript({ action: "getSlotsForDate", date: d.iso });
+      const slotsToday = slotsRes.slots || [];
       const hasFutureSlot = slotsToday.some(s => slotStartMinutes(s) >= ist.totalMinutes + BUFFER_MIN);
       if (!hasFutureSlot) continue;
     }
@@ -91,54 +92,20 @@ function getAvailableDates() {
   return dates;
 }
 
-function getSlotsForDate(dateInfo) {
-  const allSlots = (dateInfo.day === 6) ? SATURDAY_SLOTS : WEEKDAY_SLOTS;
-  if (!dateInfo.isToday) return allSlots;
-  const ist = getISTNow();
-  return allSlots.filter(s => slotStartMinutes(s) >= ist.totalMinutes + BUFFER_MIN);
-}
-
-function isHalfHourSlot(slot) { return slot.includes("4:00 PM - 4:30 PM"); }
-
-function getDateInfoFromISO(iso) {
-  // Handle case where iso comes in as a Date object (from Sheets)
-  if (iso instanceof Date) {
-    const y = iso.getFullYear();
-    const m = iso.getMonth() + 1;
-    const d = iso.getDate();
-    iso = `${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
-  }
-  // Handle case where iso is a Date-like string with extra info
-  iso = String(iso).trim();
-  // Try to extract YYYY-MM-DD pattern
-  const match = iso.match(/(\d{4})-(\d{2})-(\d{2})/);
-  if (match) {
-    iso = `${match[1]}-${match[2]}-${match[3]}`;
-  }
-
-  const dates = getAvailableDates();
+async function getDateInfoFromISO(iso) {
+  const dates = await getAvailableDates();
   const found = dates.find(d => d.iso === iso);
   if (found) return found;
-
-  const parts = iso.split('-').map(Number);
-  if (parts.length !== 3 || parts.some(isNaN)) {
-    // Fallback if parsing failed
-    return { iso: iso, display: iso, day: 0, isToday: false, year: 0, month: 0, date: 0 };
-  }
-  const [y, m, dt] = parts;
+  const [y, m, dt] = iso.split('-').map(Number);
   const d = addDaysIST(y, m, dt, 0);
   const ist = getISTNow();
   const isToday = (d.year === ist.year && d.month === ist.month && d.date === ist.date);
   return { ...d, isToday };
 }
 
-// ====== HELPERS ======
 async function callAppsScript(payload) {
   try {
-    const res = await axios.post(APPS_SCRIPT_URL, payload, {
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 20000
-    });
+    const res = await axios.post(APPS_SCRIPT_URL, payload, { headers: { 'Content-Type':'application/json' }, timeout: 25000 });
     return res.data;
   } catch (err) {
     console.error("Apps Script error:", err.message);
@@ -147,72 +114,25 @@ async function callAppsScript(payload) {
 }
 
 async function sendWhatsApp(to, body) {
-  try {
-    await twilioClient.messages.create({ from: TWILIO_WHATSAPP_NUMBER, to: to, body: body });
-  } catch (err) {
-    console.error("Twilio send error:", err.message);
-  }
+  try { await twilioClient.messages.create({ from: TWILIO_WHATSAPP_NUMBER, to, body }); }
+  catch (err) { console.error("Twilio send error:", err.message); }
 }
 
 function isValidAge(t) { const n = parseInt(t); return !isNaN(n) && n >= 1 && n <= 120; }
-function isValidPhone(t) { return /^[6-9]\d{9}$/.test(t.replace(/\s+/g, '')); }
-// Normalize a date value (could be Date, ISO string, or other) to YYYY-MM-DD string
-// Normalize a date value (could be Date, ISO string, or other) to YYYY-MM-DD string in IST
-function normalizeDateString(d) {
-  if (!d) return null;
+function extractCleanPhone(w) { return w.replace("whatsapp:", "").replace("+", "").slice(-10); }
 
-  // If it's a Date object, use IST timezone to get the date
-  if (d instanceof Date) {
-    const fmt = new Intl.DateTimeFormat('en-CA', {
-      timeZone: 'Asia/Kolkata',
-      year: 'numeric', month: '2-digit', day: '2-digit'
-    });
-    return fmt.format(d); // returns "2026-05-09" format
-  }
-
-  const s = String(d).trim();
-
-  // If string contains 'T' (ISO with time), parse as Date and format in IST
-  if (s.includes('T')) {
-    try {
-      const parsed = new Date(s);
-      if (!isNaN(parsed.getTime())) {
-        const fmt = new Intl.DateTimeFormat('en-CA', {
-          timeZone: 'Asia/Kolkata',
-          year: 'numeric', month: '2-digit', day: '2-digit'
-        });
-        return fmt.format(parsed);
-      }
-    } catch(e) {}
-  }
-
-  // Plain YYYY-MM-DD string — just clean it
-  const match = s.match(/(\d{4})-(\d{2})-(\d{2})/);
-  if (match) return `${match[1]}-${match[2]}-${match[3]}`;
-
-  return null;
-}
-
-
-function extractCleanPhone(whatsappFrom) {
-  // "whatsapp:+919876543210" -> "9876543210"
-  return whatsappFrom.replace("whatsapp:", "").replace("+", "").slice(-10);
-}
-
-// ====== HEALTH CHECK ======
 app.get('/', (req, res) => res.send('Clinic WhatsApp Bot is running ✅'));
 
-// ====== WEBHOOK ======
 app.post('/webhook', async (req, res) => {
   res.set('Content-Type', 'text/xml');
   res.send('<Response></Response>');
-
   const fromNumber = req.body.From;
   const messageBody = (req.body.Body || "").trim();
   console.log(`Incoming from ${fromNumber}: ${messageBody}`);
   if (!fromNumber || !messageBody) return;
 
   const session = await callAppsScript({ action: "getSession", phone: fromNumber });
+  if (session.found && session.date) session.date = normalizeDateString(session.date);
 
   if (["reset", "restart"].includes(messageBody.toLowerCase())) {
     await callAppsScript({ action: "deleteSession", phone: fromNumber });
@@ -221,7 +141,7 @@ app.post('/webhook', async (req, res) => {
   }
 
   if (!session.found) {
-    if (["hi", "hello", "hey", "book", "start"].includes(messageBody.toLowerCase())) {
+    if (["hi","hello","hey","book","start"].includes(messageBody.toLowerCase())) {
       await startBooking(fromNumber);
     } else {
       await sendWhatsApp(fromNumber, "👋 Welcome to Sunshine Clinic!\n\nSend 'Hi' to book an appointment.");
@@ -240,35 +160,24 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// ====== HANDLERS ======
 async function startBooking(phone) {
-  // STEP 5 NEW: Try to recognize returning patient by their phone
   const cleanPhone = extractCleanPhone(phone);
   const patient = await callAppsScript({ action: "lookupPatient", phone: cleanPhone });
-
   const result = await callAppsScript({ action: "getDoctors" });
   const doctors = result.doctors || [];
-  if (doctors.length === 0) {
-    await sendWhatsApp(phone, "Sorry, no doctors available right now.");
-    return;
-  }
+  if (doctors.length === 0) { await sendWhatsApp(phone, "Sorry, no doctors available right now."); return; }
 
-  let greeting;
-  let sessionData = { phone: phone, currentStep: "select_doctor" };
-
+  let greeting, sessionData = { phone, currentStep: "select_doctor" };
   if (patient.found && patient.name) {
-    // Returning patient — store their info in session, skip name/age later
     greeting = `👋 Welcome back, ${patient.name}!\n\nPlease select your doctor:\n\n`;
     sessionData.patientName = patient.name;
     sessionData.age = patient.age || "";
   } else {
     greeting = "👋 Welcome to Sunshine Clinic!\n\nPlease select your doctor:\n\n";
   }
-
   let msg = greeting;
   doctors.forEach((d, i) => msg += `${i + 1}. ${d.name} (${d.specialty})\n`);
   msg += "\nReply with the number.";
-
   await callAppsScript({ action: "saveSession", ...sessionData });
   await sendWhatsApp(phone, msg);
 }
@@ -283,24 +192,16 @@ async function handleDoctorSelection(phone, text, session) {
   }
   const selected = doctors[choice - 1].name;
 
-  // STEP 5 NEW: If returning patient (we already have name + age), skip to date selection
   if (session.patientName && session.age) {
-    await callAppsScript({
-      action: "saveSession", phone: phone, currentStep: "select_date",
-      doctor: selected, patientName: session.patientName, age: session.age
-    });
-    const dates = getAvailableDates();
-    if (dates.length === 0) {
-      await sendWhatsApp(phone, "😔 Sorry, no booking dates are available right now.");
-      return;
-    }
+    await callAppsScript({ action: "saveSession", phone, currentStep: "select_date", doctor: selected, patientName: session.patientName, age: session.age });
+    const dates = await getAvailableDates();
+    if (dates.length === 0) { await sendWhatsApp(phone, "😔 No booking dates available."); return; }
     let msg = `✅ You selected ${selected}.\n\n📅 Please select your appointment date:\n\n`;
     dates.forEach((d, i) => msg += `${i + 1}. ${d.display}\n`);
     msg += "\nReply with the number.";
     await sendWhatsApp(phone, msg);
   } else {
-    // New patient — ask for name first
-    await callAppsScript({ action: "saveSession", phone: phone, currentStep: "ask_name", doctor: selected });
+    await callAppsScript({ action: "saveSession", phone, currentStep: "ask_name", doctor: selected });
     await sendWhatsApp(phone, `✅ You selected ${selected}.\n\nPlease type your full name.`);
   }
 }
@@ -310,10 +211,7 @@ async function handleName(phone, text, session) {
     await sendWhatsApp(phone, "❌ Please enter a valid name (letters only, at least 2 characters).");
     return;
   }
-  await callAppsScript({
-    action: "saveSession", phone: phone, currentStep: "ask_age",
-    doctor: session.doctor, patientName: text
-  });
+  await callAppsScript({ action: "saveSession", phone, currentStep: "ask_age", doctor: session.doctor, patientName: text });
   await sendWhatsApp(phone, `Thanks ${text}!\n\nPlease enter your age (numbers only).`);
 }
 
@@ -322,103 +220,67 @@ async function handleAge(phone, text, session) {
     await sendWhatsApp(phone, "❌ Please enter a valid age between 1 and 120.");
     return;
   }
-  // Move to date selection (we already have phone from WhatsApp)
-  const dates = getAvailableDates();
-  if (dates.length === 0) {
-    await sendWhatsApp(phone, "😔 Sorry, no booking dates are available right now. Please try again later.");
-    return;
-  }
+  const dates = await getAvailableDates();
+  if (dates.length === 0) { await sendWhatsApp(phone, "😔 No booking dates available."); return; }
   let msg = "📅 Please select your appointment date:\n\n";
   dates.forEach((d, i) => msg += `${i + 1}. ${d.display}\n`);
   msg += "\nReply with the number.";
-
-  await callAppsScript({
-    action: "saveSession", phone: phone, currentStep: "select_date",
-    doctor: session.doctor, patientName: session.patientName, age: text
-  });
+  await callAppsScript({ action: "saveSession", phone, currentStep: "select_date", doctor: session.doctor, patientName: session.patientName, age: text });
   await sendWhatsApp(phone, msg);
 }
 
 async function handleDateSelection(phone, text, session) {
-  const dates = getAvailableDates();
+  const dates = await getAvailableDates();
   const choice = parseInt(text);
   if (isNaN(choice) || choice < 1 || choice > dates.length) {
     await sendWhatsApp(phone, `❌ Please reply with a number between 1 and ${dates.length}.`);
     return;
   }
   const selectedDate = dates[choice - 1];
-
   const cleanPhone = extractCleanPhone(phone);
-  const dup = await callAppsScript({
-    action: "checkDuplicate", phone: cleanPhone,
-    doctor: session.doctor, date: selectedDate.iso
-  });
+  const dup = await callAppsScript({ action: "checkDuplicate", phone: cleanPhone, doctor: session.doctor, date: selectedDate.iso });
   if (dup.duplicate) {
     await sendWhatsApp(phone, `⚠️ You already have a booking with ${session.doctor} on ${selectedDate.display}.\n\nSend 'reset' to start over.`);
     return;
   }
 
-  const slotsForDay = getSlotsForDate(selectedDate);
-  const availableSlots = [];
-  for (const slot of slotsForDay) {
-    const cnt = await callAppsScript({
-      action: "getSlotBookingCount",
-      doctor: session.doctor, date: selectedDate.iso, timeSlot: slot
-    });
-    const cap = isHalfHourSlot(slot) ? MAX_PER_HALFHOUR : MAX_PER_HOUR;
-    if ((cnt.count || 0) < cap) availableSlots.push({ slot: slot, left: cap - (cnt.count || 0) });
+  // Get available slots from Apps Script (single source of truth)
+  const slotResult = await callAppsScript({ action: "getAvailableSlots", doctor: session.doctor, date: selectedDate.iso });
+  let availableSlots = slotResult.slots || [];
+
+  // For today, also filter by buffer time
+  if (selectedDate.isToday) {
+    const ist = getISTNow();
+    availableSlots = availableSlots.filter(s => slotStartMinutes(s) >= ist.totalMinutes + BUFFER_MIN);
   }
 
   if (availableSlots.length === 0) {
-    await sendWhatsApp(phone, `😔 Sorry, no slots available for ${selectedDate.display}. Please pick another date.\n\nSend 'reset' to start over.`);
+    await sendWhatsApp(phone, `😔 No slots available for ${selectedDate.display}. Please pick another date.\n\nSend 'reset' to start over.`);
     return;
   }
 
   let msg = `🕐 Available slots for ${selectedDate.display}:\n\n`;
-  availableSlots.forEach((s, i) => msg += `${i + 1}. ${s.slot} (${s.left} seat${s.left > 1 ? 's' : ''} left)\n`);
-  msg += "\nReply with the number.";
+  availableSlots.forEach((s, i) => msg += `${i + 1}. ${s}\n`);
+  msg += "\nReply with the slot number.";
 
-  await callAppsScript({
-    action: "saveSession", phone: phone, currentStep: "select_slot",
-    doctor: session.doctor, patientName: session.patientName,
-    age: session.age, date: selectedDate.iso
-  });
+  await callAppsScript({ action: "saveSession", phone, currentStep: "select_slot", doctor: session.doctor, patientName: session.patientName, age: session.age, date: selectedDate.iso });
   await sendWhatsApp(phone, msg);
 }
+
 async function handleSlotSelection(phone, text, session) {
   const choice = parseInt(text);
-
   const normalizedDate = normalizeDateString(session.date);
-  console.log(`[handleSlotSelection] session.date raw:`, session.date, `normalized:`, normalizedDate);
+  if (!normalizedDate) { await sendWhatsApp(phone, "⚠️ Date error. Please send 'reset' to start over."); return; }
+  const dateInfo = await getDateInfoFromISO(normalizedDate);
 
-  if (!normalizedDate) {
-    await sendWhatsApp(phone, "⚠️ Date error. Please send 'reset' to start over.");
-    return;
+  const slotResult = await callAppsScript({ action: "getAvailableSlots", doctor: session.doctor, date: normalizedDate });
+  let availableSlots = slotResult.slots || [];
+  if (dateInfo.isToday) {
+    const ist = getISTNow();
+    availableSlots = availableSlots.filter(s => slotStartMinutes(s) >= ist.totalMinutes + BUFFER_MIN);
   }
 
-  const dateInfo = getDateInfoFromISO(normalizedDate);
-  console.log(`[handleSlotSelection] dateInfo:`, JSON.stringify(dateInfo));
-
-  const slotsForDay = getSlotsForDate(dateInfo);
-  console.log(`[handleSlotSelection] slotsForDay (${slotsForDay.length}):`, slotsForDay);
-
-  const availableSlots = [];
-  for (const slot of slotsForDay) {
-    const cnt = await callAppsScript({
-      action: "getSlotBookingCount",
-      doctor: session.doctor, date: normalizedDate, timeSlot: slot
-    });
-    const cap = isHalfHourSlot(slot) ? MAX_PER_HALFHOUR : MAX_PER_HOUR;
-    console.log(`[handleSlotSelection] slot=${slot} count=${cnt.count} cap=${cap}`);
-    if ((cnt.count || 0) < cap) availableSlots.push(slot);
-  }
-
-  console.log(`[handleSlotSelection] available count: ${availableSlots.length}`);
-
-  if (availableSlots.length === 0) {
-    await sendWhatsApp(phone, "😔 No slots available anymore. Please send 'reset' and try again.");
-    return;
-  }
+  if (availableSlots.length === 0) { await sendWhatsApp(phone, "😔 No slots available anymore. Send 'reset' to try again."); return; }
   if (isNaN(choice) || choice < 1 || choice > availableSlots.length) {
     await sendWhatsApp(phone, `❌ Please reply with a number between 1 and ${availableSlots.length}.`);
     return;
@@ -426,71 +288,52 @@ async function handleSlotSelection(phone, text, session) {
 
   const selectedSlot = availableSlots[choice - 1];
   const cleanPhone = extractCleanPhone(phone);
+  await callAppsScript({ action: "saveSession", phone, currentStep: "confirm", doctor: session.doctor, patientName: session.patientName, age: session.age, date: normalizedDate, timeSlot: selectedSlot });
 
-  await callAppsScript({
-    action: "saveSession", phone: phone, currentStep: "confirm",
-    doctor: session.doctor, patientName: session.patientName,
-    age: session.age, date: normalizedDate, timeSlot: selectedSlot
-  });
-
-  const summary =
-    `📋 *Please confirm your appointment:*\n\n` +
+  const summary = `📋 *Please confirm your appointment:*\n\n` +
     `👨‍⚕️ Doctor: ${session.doctor}\n` +
     `🧑 Patient: ${session.patientName}\n` +
     `🎂 Age: ${session.age}\n` +
     `📞 Phone: ${cleanPhone}\n` +
     `📅 Date: ${dateInfo.display}\n` +
     `🕐 Time: ${selectedSlot}\n\n` +
-    `1. ✅ Confirm Appointment\n` +
-    `2. ✏️ Make Changes\n\nReply with 1 or 2.`;
+    `1. ✅ Confirm Appointment\n2. ✏️ Make Changes\n\nReply with 1 or 2.`;
   await sendWhatsApp(phone, summary);
 }
 
 async function handleConfirmation(phone, text, session) {
   const choice = text.trim();
   const cleanPhone = extractCleanPhone(phone);
+  const normalizedDate = normalizeDateString(session.date);
 
   if (choice === "1" || choice.toLowerCase().includes("confirm")) {
-    const cnt = await callAppsScript({
-      action: "getSlotBookingCount",
-      doctor: session.doctor, date: session.date, timeSlot: session.timeSlot
-    });
-    const cap = isHalfHourSlot(session.timeSlot) ? MAX_PER_HALFHOUR : MAX_PER_HOUR;
-    if ((cnt.count || 0) >= cap) {
-      await callAppsScript({ action: "deleteSession", phone: phone });
-      await sendWhatsApp(phone, "😔 Sorry, that slot was just taken. Please send 'Hi' to start a new booking.");
-      return;
-    }
-
     const result = await callAppsScript({
       action: "saveBooking",
       doctor: session.doctor, patientName: session.patientName,
       age: session.age, phone: cleanPhone,
-      date: session.date, timeSlot: session.timeSlot
+      date: normalizedDate, timeSlot: session.timeSlot
     });
-    await callAppsScript({ action: "deleteSession", phone: phone });
+    await callAppsScript({ action: "deleteSession", phone });
 
     if (result.success) {
-      const dateInfo = getDateInfoFromISO(session.date);
-      const confirmMsg =
-        `✅ *Appointment Confirmed!*\n\n` +
+      const dateInfo = await getDateInfoFromISO(normalizedDate);
+      const confirmMsg = `✅ *Appointment Confirmed!*\n\n` +
         `👨‍⚕️ Doctor: ${session.doctor}\n` +
         `🧑 Patient: ${session.patientName}\n` +
         `🎂 Age: ${session.age}\n` +
         `📞 Contact: ${cleanPhone}\n` +
-        `📅Date: ${dateInfo.display || session.date}\n` +
+        `📅 Date: ${dateInfo.display}\n` +
         `🕐 Time: ${session.timeSlot}\n` +
         `🎫 Token: *${result.token}*\n\n` +
-        `Please arrive 10 minutes before your slot.\n` +
-        `To cancel, reply: CANCEL ${result.bookingId}\n\nThank you! 🙏`;
+        `Please arrive 10 minutes before your slot.\nTo cancel, reply: CANCEL ${result.bookingId}\n\nThank you! 🙏`;
       await sendWhatsApp(phone, confirmMsg);
     } else if (result.error === "SLOT_FULL") {
-      await sendWhatsApp(phone, "😔 Sorry, that slot just got filled. Please send 'Hi' to book again.");
+      await sendWhatsApp(phone, "😔 Sorry, that slot was just taken by someone else. Please send 'Hi' to book again.");
     } else {
-      await sendWhatsApp(phone, "⚠️ Something went wrong. Please try again or contact the clinic.");
+      await sendWhatsApp(phone, "⚠️ Something went wrong. Please try again.");
     }
   } else if (choice === "2" || choice.toLowerCase().includes("change")) {
-    await callAppsScript({ action: "deleteSession", phone: phone });
+    await callAppsScript({ action: "deleteSession", phone });
     await startBooking(phone);
   } else {
     await sendWhatsApp(phone, "❌ Please reply with 1 to Confirm or 2 to Make Changes.");
