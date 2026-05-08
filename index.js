@@ -166,7 +166,7 @@ app.post('/webhook', async (req, res) => {
     if (["hi", "hello", "hey", "book", "start"].includes(messageBody.toLowerCase())) {
       await startBooking(fromNumber);
     } else {
-      await sendWhatsApp(fromNumber, "👋 Welcome to All Doctors Clinic!\n\nSend 'Hi' to book an appointment.");
+      await sendWhatsApp(fromNumber, "👋 Welcome to Sunshine Clinic!\n\nSend 'Hi' to book an appointment.");
     }
     return;
   }
