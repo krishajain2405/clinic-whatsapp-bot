@@ -157,26 +157,39 @@ async function sendWhatsApp(to, body) {
 function isValidAge(t) { const n = parseInt(t); return !isNaN(n) && n >= 1 && n <= 120; }
 function isValidPhone(t) { return /^[6-9]\d{9}$/.test(t.replace(/\s+/g, '')); }
 // Normalize a date value (could be Date, ISO string, or other) to YYYY-MM-DD string
+// Normalize a date value (could be Date, ISO string, or other) to YYYY-MM-DD string in IST
 function normalizeDateString(d) {
   if (!d) return null;
+
+  // If it's a Date object, use IST timezone to get the date
   if (d instanceof Date) {
-    const y = d.getFullYear();
-    const m = d.getMonth() + 1;
-    const dt = d.getDate();
-    return `${y}-${String(m).padStart(2,'0')}-${String(dt).padStart(2,'0')}`;
+    const fmt = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Kolkata',
+      year: 'numeric', month: '2-digit', day: '2-digit'
+    });
+    return fmt.format(d); // returns "2026-05-09" format
   }
+
   const s = String(d).trim();
+
+  // If string contains 'T' (ISO with time), parse as Date and format in IST
+  if (s.includes('T')) {
+    try {
+      const parsed = new Date(s);
+      if (!isNaN(parsed.getTime())) {
+        const fmt = new Intl.DateTimeFormat('en-CA', {
+          timeZone: 'Asia/Kolkata',
+          year: 'numeric', month: '2-digit', day: '2-digit'
+        });
+        return fmt.format(parsed);
+      }
+    } catch(e) {}
+  }
+
+  // Plain YYYY-MM-DD string — just clean it
   const match = s.match(/(\d{4})-(\d{2})-(\d{2})/);
   if (match) return `${match[1]}-${match[2]}-${match[3]}`;
-  try {
-    const parsed = new Date(s);
-    if (!isNaN(parsed.getTime())) {
-      const y = parsed.getFullYear();
-      const m = parsed.getMonth() + 1;
-      const dt = parsed.getDate();
-      return `${y}-${String(m).padStart(2,'0')}-${String(dt).padStart(2,'0')}`;
-    }
-  } catch(e) {}
+
   return null;
 }
 
