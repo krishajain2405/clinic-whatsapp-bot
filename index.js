@@ -101,10 +101,31 @@ function getSlotsForDate(dateInfo) {
 function isHalfHourSlot(slot) { return slot.includes("4:00 PM - 4:30 PM"); }
 
 function getDateInfoFromISO(iso) {
+  // Handle case where iso comes in as a Date object (from Sheets)
+  if (iso instanceof Date) {
+    const y = iso.getFullYear();
+    const m = iso.getMonth() + 1;
+    const d = iso.getDate();
+    iso = `${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+  }
+  // Handle case where iso is a Date-like string with extra info
+  iso = String(iso).trim();
+  // Try to extract YYYY-MM-DD pattern
+  const match = iso.match(/(\d{4})-(\d{2})-(\d{2})/);
+  if (match) {
+    iso = `${match[1]}-${match[2]}-${match[3]}`;
+  }
+
   const dates = getAvailableDates();
   const found = dates.find(d => d.iso === iso);
   if (found) return found;
-  const [y, m, dt] = iso.split('-').map(Number);
+
+  const parts = iso.split('-').map(Number);
+  if (parts.length !== 3 || parts.some(isNaN)) {
+    // Fallback if parsing failed
+    return { iso: iso, display: iso, day: 0, isToday: false, year: 0, month: 0, date: 0 };
+  }
+  const [y, m, dt] = parts;
   const d = addDaysIST(y, m, dt, 0);
   const ist = getISTNow();
   const isToday = (d.year === ist.year && d.month === ist.month && d.date === ist.date);
@@ -365,7 +386,7 @@ async function handleSlotSelection(phone, text, session) {
     `🧑 Patient: ${session.patientName}\n` +
     `🎂 Age: ${session.age}\n` +
     `📞 Phone: ${cleanPhone}\n` +
-    `📅 Date: ${dateInfo.display}\n` +
+    `📅 Date: ${dateInfo.display || session.date}\n` +
     `🕐 Time: ${selectedSlot}\n\n` +
     `1. ✅ Confirm Appointment\n` +
     `2. ✏️ Make Changes\n\nReply with 1 or 2.`;
@@ -404,7 +425,7 @@ async function handleConfirmation(phone, text, session) {
         `🧑 Patient: ${session.patientName}\n` +
         `🎂 Age: ${session.age}\n` +
         `📞 Contact: ${cleanPhone}\n` +
-        `📅 Date: ${dateInfo.display}\n` +
+        `📅Date: ${dateInfo.display || session.date}\n` +
         `🕐 Time: ${session.timeSlot}\n` +
         `🎫 Token: *${result.token}*\n\n` +
         `Please arrive 10 minutes before your slot.\n` +
