@@ -156,6 +156,30 @@ async function sendWhatsApp(to, body) {
 
 function isValidAge(t) { const n = parseInt(t); return !isNaN(n) && n >= 1 && n <= 120; }
 function isValidPhone(t) { return /^[6-9]\d{9}$/.test(t.replace(/\s+/g, '')); }
+// Normalize a date value (could be Date, ISO string, or other) to YYYY-MM-DD string
+function normalizeDateString(d) {
+  if (!d) return null;
+  if (d instanceof Date) {
+    const y = d.getFullYear();
+    const m = d.getMonth() + 1;
+    const dt = d.getDate();
+    return `${y}-${String(m).padStart(2,'0')}-${String(dt).padStart(2,'0')}`;
+  }
+  const s = String(d).trim();
+  const match = s.match(/(\d{4})-(\d{2})-(\d{2})/);
+  if (match) return `${match[1]}-${match[2]}-${match[3]}`;
+  try {
+    const parsed = new Date(s);
+    if (!isNaN(parsed.getTime())) {
+      const y = parsed.getFullYear();
+      const m = parsed.getMonth() + 1;
+      const dt = parsed.getDate();
+      return `${y}-${String(m).padStart(2,'0')}-${String(dt).padStart(2,'0')}`;
+    }
+  } catch(e) {}
+  return null;
+}
+
 
 function extractCleanPhone(whatsappFrom) {
   // "whatsapp:+919876543210" -> "9876543210"
@@ -348,20 +372,36 @@ async function handleDateSelection(phone, text, session) {
   });
   await sendWhatsApp(phone, msg);
 }
-
 async function handleSlotSelection(phone, text, session) {
   const choice = parseInt(text);
-  const dateInfo = getDateInfoFromISO(session.date);
+
+  const normalizedDate = normalizeDateString(session.date);
+  console.log(`[handleSlotSelection] session.date raw:`, session.date, `normalized:`, normalizedDate);
+
+  if (!normalizedDate) {
+    await sendWhatsApp(phone, "⚠️ Date error. Please send 'reset' to start over.");
+    return;
+  }
+
+  const dateInfo = getDateInfoFromISO(normalizedDate);
+  console.log(`[handleSlotSelection] dateInfo:`, JSON.stringify(dateInfo));
+
   const slotsForDay = getSlotsForDate(dateInfo);
+  console.log(`[handleSlotSelection] slotsForDay (${slotsForDay.length}):`, slotsForDay);
+
   const availableSlots = [];
   for (const slot of slotsForDay) {
     const cnt = await callAppsScript({
       action: "getSlotBookingCount",
-      doctor: session.doctor, date: session.date, timeSlot: slot
+      doctor: session.doctor, date: normalizedDate, timeSlot: slot
     });
     const cap = isHalfHourSlot(slot) ? MAX_PER_HALFHOUR : MAX_PER_HOUR;
+    console.log(`[handleSlotSelection] slot=${slot} count=${cnt.count} cap=${cap}`);
     if ((cnt.count || 0) < cap) availableSlots.push(slot);
   }
+
+  console.log(`[handleSlotSelection] available count: ${availableSlots.length}`);
+
   if (availableSlots.length === 0) {
     await sendWhatsApp(phone, "😔 No slots available anymore. Please send 'reset' and try again.");
     return;
@@ -377,7 +417,7 @@ async function handleSlotSelection(phone, text, session) {
   await callAppsScript({
     action: "saveSession", phone: phone, currentStep: "confirm",
     doctor: session.doctor, patientName: session.patientName,
-    age: session.age, date: session.date, timeSlot: selectedSlot
+    age: session.age, date: normalizedDate, timeSlot: selectedSlot
   });
 
   const summary =
@@ -386,7 +426,7 @@ async function handleSlotSelection(phone, text, session) {
     `🧑 Patient: ${session.patientName}\n` +
     `🎂 Age: ${session.age}\n` +
     `📞 Phone: ${cleanPhone}\n` +
-    `📅 Date: ${dateInfo.display || session.date}\n` +
+    `📅 Date: ${dateInfo.display}\n` +
     `🕐 Time: ${selectedSlot}\n\n` +
     `1. ✅ Confirm Appointment\n` +
     `2. ✏️ Make Changes\n\nReply with 1 or 2.`;
